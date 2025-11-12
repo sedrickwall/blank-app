@@ -1,1 +1,13 @@
-streamlit
+# Core framework
+streamlit==1.39.0
+pandas>=2.1.0
+plotly>=5.18.0
+
+# Google Sheets (optional sync)
+gspread>=6.0.0
+google-auth>=2.30.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+
+# Utility
+requests>=2.31.0
