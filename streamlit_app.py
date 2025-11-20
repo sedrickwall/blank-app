@@ -77,10 +77,13 @@ def csv_spend_path(account):  return os.path.join(DATA_DIR, f"{account.lower()}_
 
 def ensure_budget_schema(df):
     cols = ["Category","Check1","Check2","Check3","Check4","Monthly_Total"]
-    for c in cols:
-        if c not in df.columns: df[c] = 0.0
-    df["Monthly_Total"] = df[["Check1","Check2","Check3","Check4"]].fillna(0).sum(axis=1)
-    return df[cols]
+for c in ["Amount","Check1","Check2","Check3","Check4","Monthly_Total"]:
+    if c in budget_df.columns:
+        budget_df[c] = pd.to_numeric(budget_df[c], errors="coerce").fillna(0)
+        
+    # Show the header ONLY once
+    st.subheader(f"{account} Overview")
+
 
 def load_income(account):
     dash_path = os.path.join(DATA_DIR,"dashboard_data.csv")
