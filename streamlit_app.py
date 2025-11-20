@@ -36,7 +36,8 @@ def get_gspread_client_from_secrets():
 # ---------------------------
 st.set_page_config(page_title="Family Stewardship Dashboard", page_icon="📊", layout="wide")
 
-DATA_DIR = "data" os.makedirs(DATA_DIR, exist_ok=True)
+DATA_DIR = "data" 
+os.makedirs(DATA_DIR, exist_ok=True)
 USE_SHEETS_DEFAULT = False  
 
 # Default settings
