@@ -3,6 +3,34 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
+# ---------------------------------------
+# GOOGLE SHEETS SUPPORT
+# ---------------------------------------
+USE_SHEETS_DEFAULT = False  # Default checked value
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+# Try loading Google Sheets libraries
+_gs_ok = True
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    _gs_ok = False
+
+
+def get_gspread_client_from_secrets():
+    """Authenticate using Streamlit secrets (service account)."""
+    if not _gs_ok:
+        raise RuntimeError("gspread/google-auth not installed in environment.")
+
+    if "gcp_service_account" not in st.secrets:
+        raise RuntimeError("Missing 'gcp_service_account' in Streamlit secrets.")
+
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    return gspread.authorize(creds)
+
 # ---------------------------
 # CONFIG
 # ---------------------------
@@ -84,6 +112,50 @@ def show_scripture():
         st.session_state["verse_idx"] = (verse_idx + 1) % len(SCRIPTURE)
         st.experimental_rerun()
 
+# Default setting for Google Sheets toggle
+USE_SHEETS_DEFAULT = False
+
+# Default values so Streamlit never throws NameError
+use_sheets = False
+sh = None
+
+with st.sidebar:
+    st.markdown("### Data Source")
+    use_sheets = st.checkbox("Use Google Sheets (optional)", value=USE_SHEETS_DEFAULT and _gs_ok)
+
+    if use_sheets and not _gs_ok:
+        st.warning("gspread/google-auth not installed. Using CSV fallback.")
+        use_sheets = False
+
+    if use_sheets:
+        sheet_id = st.text_input("Google Sheet ID", value=st.secrets.get("GOOGLE_SHEET_ID", ""))
+
+        if sheet_id:
+            try:
+                client = get_gspread_client_from_secrets()
+                sh = client.open_by_key(sheet_id)
+                st.success("Connected to Google Sheet.")
+            except Exception as e:
+                st.error(f"Google Sheets error: {e}")
+                use_sheets = False
+        else:
+            st.info("Enter GOOGLE_SHEET_ID in secrets to enable Sheets.")
+
+#--Auto-reduce budgets per category when vacancy mode is ON---#
+
+def apply_vacancy_to_budget(budget_df, vacancy_pct):
+    """Returns a copy of the budget with Monthly_Total reduced by vacancy %."""
+    adj_factor = (100 - vacancy_pct) / 100
+    adj_df = budget_df.copy()
+
+    for col in ["Check1", "Check2", "Check3", "Check4"]:
+        if col in adj_df.columns:
+            adj_df[col] = pd.to_numeric(adj_df[col], errors="coerce").fillna(0) * adj_factor
+
+    adj_df["Monthly_Total"] = adj_df[["Check1", "Check2", "Check3", "Check4"]].sum(axis=1)
+
+    return adj_df
+
 # ---------------------------
 # MAIN APP
 # ---------------------------
@@ -106,85 +178,113 @@ with tab1:
     for c in ["Amount","Check1","Check2","Check3","Check4","Monthly_Total"]:
         if c in budget_df.columns: budget_df[c]=pd.to_numeric(budget_df[c],errors="coerce").fillna(0)
 
-    st.subheader(f"{account} Overview")
-
-    # -----------------------------
-    # 💵 PER-CHECK INCOME + VACANCY
-    # -----------------------------
+        st.subheader(f"{account} Overview")
+#---
+    # --------------------------------------------
+    # 🧾 PER-CHECK INCOME INPUTS + TOTAL SUMMARY
+    # --------------------------------------------
     st.markdown("### 💵 Enter This Month's Income")
-    check_vals = [float(v) for v in load_income(account)]
+
+    # Load saved income values
+    check_values = load_income(account)  # [c1, c2, c3, c4]
+
     c1, c2, c3, c4, c5 = st.columns(5)
-    checks = [
-        c1.number_input("Check 1 ($)", min_value=0.0, step=100.0, value=float(check_vals[0]), key=f"{account}_c1"),
-        c2.number_input("Check 2 ($)", min_value=0.0, step=100.0, value=float(check_vals[1]), key=f"{account}_c2"),
-        c3.number_input("Check 3 ($)", min_value=0.0, step=100.0, value=float(check_vals[2]), key=f"{account}_c3"),
-        c4.number_input("Check 4 ($)", min_value=0.0, step=100.0, value=float(check_vals[3]), key=f"{account}_c4")
-    ]
-    total_income = sum(checks)
+
+    check1 = c1.number_input("Check 1 Amount ($)", min_value=0.0, step=100.0,
+                            value=float(check_values[0]), key=f"{account}_chk1")
+
+    check2 = c2.number_input("Check 2 Amount ($)", min_value=0.0, step=100.0,
+                            value=float(check_values[1]), key=f"{account}_chk2")
+
+    check3 = c3.number_input("Check 3 Amount ($)", min_value=0.0, step=100.0,
+                            value=float(check_values[2]), key=f"{account}_chk3")
+
+    check4 = c4.number_input("Check 4 Amount ($)", min_value=0.0, step=100.0,
+                            value=float(check_values[3]), key=f"{account}_chk4")
+
+    # Build list for saving
+    check_inputs = [check1, check2, check3, check4]
+    total_income = sum(check_inputs)
+
     c5.metric("💰 Total Monthly Income", f"${total_income:,.2f}")
 
+    # --- Save income (local ONLY for now) ---
     if st.button("💾 Save Income", key=f"save_income_{account}"):
-        save_income(account, checks, use_sheets, sh)
-        st.success("Income saved and synced!")
+        try:
+            save_income(account, check_inputs)
+            st.success("Income saved successfully!")
+        except Exception as e:
+            st.error(f"Error saving income: {e}")
+
+    # Persist income to session_state
+    st.session_state[f"{account}_income"] = total_income
+
 
     # -----------------------------
     # 🏠 VACANCY MODE ADJUSTMENT
     # -----------------------------
     st.markdown("### 🏠 Vacancy Adjustment Mode")
 
-    # Load persisted vacancy setting
     dash_path = os.path.join(DATA_DIR, "dashboard_data.csv")
     dash_df = load_or_create_csv(dash_path, ["Key", "Value"])
+
     vacancy_key = f"{account}_Vacancy_Mode"
     vacancy_pct_key = f"{account}_Vacancy_Pct"
 
-    vacancy_mode = st.checkbox("Enable Vacancy Mode (temporary income reduction)", value=False, key=f"{account}_vacancy_toggle")
-    vacancy_pct = float(
-        dash_df.loc[dash_df["Key"] == vacancy_pct_key, "Value"].iloc[0]
-    ) if vacancy_pct_key in dash_df["Key"].values else 20.0
+    # Load defaults
+    saved_mode = dash_df.loc[dash_df["Key"] == vacancy_key, "Value"].iloc[0] if vacancy_key in dash_df["Key"].values else "False"
+    saved_pct  = dash_df.loc[dash_df["Key"] == vacancy_pct_key, "Value"].iloc[0] if vacancy_pct_key in dash_df["Key"].values else 20
 
+    vacancy_mode = st.checkbox("Enable Vacancy Mode (temporary income reduction)",
+                            value=(saved_mode == "True"),
+                            key=f"{account}_vacancy_toggle")
+
+    vacancy_pct = st.slider("Vacancy Reduction %", 0, 100, int(saved_pct), 5,
+                            key=f"{account}_vacancy_pct")
+
+    # Adjusted income
     if vacancy_mode:
-        vacancy_pct = st.slider("Vacancy Reduction %", 0, 100, int(vacancy_pct), 5, key=f"{account}_vacancy_pct")
         adj_factor = (100 - vacancy_pct) / 100
         adjusted_income = total_income * adj_factor
-        st.warning(f"Vacancy mode ON — reducing total income by {vacancy_pct}% → New Total: ${adjusted_income:,.2f}")
+
+        # Apply vacancy to budgets
+        adj_budget_df = apply_vacancy_to_budget(budget_df, vacancy_pct)
+
+        st.warning(
+            f"Vacancy mode ON — income & budgets reduced by {vacancy_pct}% "
+            f"→ New Income: ${adjusted_income:,.2f}"
+        )
     else:
         adjusted_income = total_income
+        adj_budget_df = budget_df.copy()
 
-    # Persist settings (local or Google Sheets)
+    # Save vacancy settings
     if st.button("💾 Save Vacancy Settings", key=f"save_vacancy_{account}"):
-        if use_sheets and sh is not None:
-            ws_dash = open_or_create_ws(sh, "Dashboard_Data", ["Key", "Value"])
-            ws_dash.update(f"A1:B1", [["Key", "Value"]])
-            rows = ws_dash.get_all_values()
-            df_dash = pd.DataFrame(rows[1:], columns=rows[0]) if len(rows) > 1 else pd.DataFrame(columns=["Key", "Value"])
-            updates = {
-                vacancy_key: str(vacancy_mode),
-                vacancy_pct_key: vacancy_pct,
-                f"{account}_Adjusted_Income": adjusted_income,
-            }
-            for k, v in updates.items():
-                if k in df_dash["Key"].values:
-                    ws_dash.update_cell(df_dash.index[df_dash["Key"] == k][0] + 2, 2, v)
-                else:
-                    ws_dash.append_row([k, v])
-        else:
-            for k, v in {
-                vacancy_key: str(vacancy_mode),
-                vacancy_pct_key: vacancy_pct,
-                f"{account}_Adjusted_Income": adjusted_income,
-            }.items():
-                if k in dash_df["Key"].values:
-                    dash_df.loc[dash_df["Key"] == k, "Value"] = v
-                else:
-                    dash_df.loc[len(dash_df)] = [k, v]
-            save_df(dash_df, dash_path)
+        dash_df = load_or_create_csv(dash_path, ["Key", "Value"])
+
+        updates = {
+            vacancy_key: str(vacancy_mode),
+            vacancy_pct_key: vacancy_pct,
+            f"{account}_Adjusted_Income": adjusted_income
+        }
+
+        for k, v in updates.items():
+            if k in dash_df["Key"].values:
+                dash_df.loc[dash_df["Key"] == k, "Value"] = v
+            else:
+                dash_df.loc[len(dash_df)] = [k, v]
+
+        save_df(dash_df, dash_path)
         st.success("Vacancy settings saved!")
 
+    # Save adjusted income to session
+    st.session_state[f"{account}_adjusted_income"] = adjusted_income
+
+#-----
     # Apply adjustment globally for current session
     st.session_state[f"{account}_adjusted_income"] = adjusted_income
     st.session_state[f"{account}_vacancy_mode"] = vacancy_mode
-    st.session_state[f"{account}_vacancy_pct"] = vacancy_pct
+    #--st.session_state[f"{account}_vacancy_pct"] = vacancy_pct
 
 
     # -----------------------------
@@ -197,9 +297,9 @@ with tab1:
         for c in ["Check1","Check2","Check3","Check4"]:
             budget_df[c]=pd.to_numeric(edit[c],errors="coerce").fillna(0)
         budget_df["Monthly_Total"]=budget_df[["Check1","Check2","Check3","Check4"]].sum(axis=1)
-        st.dataframe(budget_df[["Category","Monthly_Total"]],use_container_width=True)
+        st.dataframe(adj_budget_df[["Category","Monthly_Total"]], use_container_width=True)
         if st.button("💾 Save Budgets",key=f"saveb_{account}"):
-            save_df(budget_df,budget_path)
+            save_df(adj_budget_df, budget_path)
             st.success("Budgets saved locally.")
 
     with colB:
