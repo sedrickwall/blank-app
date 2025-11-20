@@ -177,10 +177,10 @@ with tab1:
     budget_df = load_or_create_csv(budget_path,["Category","Check1","Check2","Check3","Check4","Monthly_Total"])
     budget_df = ensure_budget_schema(budget_df)
     spending_df = load_or_create_csv(spend_path,["Date","Category","Amount","Memo"])
-  for c in ["Amount","Check1","Check2","Check3","Check4","Monthly_Total"]:
+for c in ["Amount","Check1","Check2","Check3","Check4","Monthly_Total"]:
     if c in budget_df.columns:
         budget_df[c] = pd.to_numeric(budget_df[c], errors="coerce").fillna(0)
-
+    
     # Show the header ONLY once
     st.subheader(f"{account} Overview")
 #---
