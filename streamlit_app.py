@@ -163,6 +163,30 @@ with st.sidebar:
 
 #--Auto-reduce budgets per category when vacancy mode is ON---#
 
+def generate_auto_budget(check_amount, category_allocations, vacancy_mode=False, vacancy_pct=0):
+    """
+    Automatically allocates a check amount according to percentages.
+    category_allocations: dict like {"Tithe": 10, "Savings": 5, "Food": 15}
+    """
+    # --- Safety 1: prevent crash on empty or zero check ---
+    if check_amount is None or check_amount <= 0:
+        return {cat: 0 for cat in category_allocations}
+
+    # --- Safety 2: apply vacancy if enabled ---
+    if vacancy_mode:
+        check_amount = check_amount * (100 - vacancy_pct) / 100
+
+    # --- Safety 3: prevent crash if no categories or all 0% ---
+    total_pct = sum(category_allocations.values())
+    if total_pct <= 0:
+        return {cat: 0 for cat in category_allocations}
+
+    # --- Compute safe allocations ---
+    return {
+        cat: round(check_amount * (pct / total_pct), 2)
+        for cat, pct in category_allocations.items()
+    }
+
 def apply_vacancy_to_budget(budget_df, vacancy_pct):
     """Returns a copy of the budget with Monthly_Total reduced by vacancy %."""
     adj_factor = (100 - vacancy_pct) / 100
@@ -176,42 +200,44 @@ def apply_vacancy_to_budget(budget_df, vacancy_pct):
 
     return adj_df
 
-def auto_fill_budget(df, check_inputs, vacancy_pct=0):
+def auto_fill_budget(df, check_inputs, auto_pct_map, vacancy_mode=False, vacancy_pct=0):
     """
-    Automatically fills the Check1–Check4 budget amounts based on 
-    percentage rules + vacancy reduction.
+    Fill Check1–Check4 using percent rules (auto_pct_map) and optional vacancy.
+    - df: budget df with Category, Check1..Check4
+    - check_inputs: [c1, c2, c3, c4] numeric
+    - auto_pct_map: {"Tithe": 10, "Savings (Emergency)": 5, ...}  (percents)
     """
+    # Normalize map to only categories in df, defaulting missing to 0
+    cats = list(df["Category"])
+    pct_map = {c: float(auto_pct_map.get(c, 0)) for c in cats}
 
-    adj_factor = (100 - vacancy_pct) / 100  # vacancy reduction
+    # If total is 0, just set everything to 0 safely
+    total_pct = sum(pct_map.values())
+    if total_pct <= 0:
+        for col in ["Check1","Check2","Check3","Check4"]:
+            df[col] = 0.0
+        df["Monthly_Total"] = 0.0
+        return df
 
+    # Normalize to 100% to avoid surprises
+    scale = 100.0 / total_pct
+    pct_map = {c: p * scale for c, p in pct_map.items()}
+
+    adj = (100 - vacancy_pct) / 100.0 if vacancy_mode else 1.0
+
+    # Allocate for each category and check
     for idx, row in df.iterrows():
         cat = row["Category"]
+        pct = pct_map.get(cat, 0.0) / 100.0
+        df.at[idx, "Check1"] = check_inputs[0] * pct * adj
+        df.at[idx, "Check2"] = check_inputs[1] * pct * adj
+        df.at[idx, "Check3"] = check_inputs[2] * pct * adj
+        df.at[idx, "Check4"] = check_inputs[3] * pct * adj
 
-        # Fixed % categories
-        if cat in AUTO_PCTS:
-            pct = AUTO_PCTS[cat] / 100
-
-            # Calculate each check amount
-            df.at[idx, "Check1"] = check_inputs[0] * pct * adj_factor
-            df.at[idx, "Check2"] = check_inputs[1] * pct * adj_factor
-            df.at[idx, "Check3"] = check_inputs[2] * pct * adj_factor
-            df.at[idx, "Check4"] = check_inputs[3] * pct * adj_factor
-
-        # Flexible categories get "whatever is left"
-        else:
-            # First calculate the sum of fixed % categories
-            fixed_total_pct = sum(AUTO_PCTS.values()) / 100
-            remaining_pct = (1 - fixed_total_pct)
-
-            # Give proportional allocation
-            df.at[idx, "Check1"] = check_inputs[0] * remaining_pct * adj_factor / (len(df) - len(AUTO_PCTS))
-            df.at[idx, "Check2"] = check_inputs[1] * remaining_pct * adj_factor / (len(df) - len(AUTO_PCTS))
-            df.at[idx, "Check3"] = check_inputs[2] * remaining_pct * adj_factor / (len(df) - len(AUTO_PCTS))
-            df.at[idx, "Check4"] = check_inputs[3] * remaining_pct * adj_factor / (len(df) - len(AUTO_PCTS))
-
-    # Recalculate monthly total
     df["Monthly_Total"] = df[["Check1","Check2","Check3","Check4"]].sum(axis=1)
     return df
+
+
 
 
 # ---------------------------
@@ -224,182 +250,190 @@ show_scripture()
 tab1, tab2 = st.tabs(["💼 Accounts","📈 Insights"])
 
 # ==========================================================
-# TAB 1 — ACCOUNT MANAGEMENT
+# TAB 1 — ACCOUNT MANAGEMENT  (DROP-IN REPLACEMENT)
 # ==========================================================
 with tab1:
-    account = st.selectbox("Select Account", ACCOUNTS)
+    account = st.selectbox("Select Account", ACCOUNTS, key="acct_select")
     budget_path, spend_path = csv_budget_path(account), csv_spend_path(account)
 
-    budget_df = load_or_create_csv(budget_path,["Category","Check1","Check2","Check3","Check4","Monthly_Total"])
+    # Load data once
+    budget_df = load_or_create_csv(
+        budget_path,
+        ["Category","Check1","Check2","Check3","Check4","Monthly_Total"]
+    )
     budget_df = ensure_budget_schema(budget_df)
-    spending_df = load_or_create_csv(spend_path,["Date","Category","Amount","Memo"])
-for c in ["Amount","Check1","Check2","Check3","Check4","Monthly_Total"]:
-    if c in budget_df.columns:
-        budget_df[c] = pd.to_numeric(budget_df[c], errors="coerce").fillna(0)
 
-    # Show the header ONLY once
+    spending_df = load_or_create_csv(
+        spend_path,
+        ["Date","Category","Amount","Memo"]
+    )
+
+    # Convert numeric cols once
+    for c in ["Check1","Check2","Check3","Check4","Monthly_Total"]:
+        if c in budget_df.columns:
+            budget_df[c] = pd.to_numeric(budget_df[c], errors="coerce").fillna(0.0)
+    if "Amount" in spending_df.columns:
+        spending_df["Amount"] = pd.to_numeric(spending_df["Amount"], errors="coerce").fillna(0.0)
+
+    # ✅ Header appears only once (was inside a loop before)
     st.subheader(f"{account} Overview")
-#---
 
-# ---------------------------------------------------------
-# LOAD VACANCY STATE GLOBALLY FOR AUTO-BUDGET GENERATION
-# ---------------------------------------------------------
-    vacancy_mode = st.session_state.get(f"{account}_vacancy_mode", False)
-    vacancy_pct = st.session_state.get(f"{account}_vacancy_pct", DEFAULT_VACANCY_REDUCTION)
-
-    # --------------------------------------------
-    # 🧾 PER-CHECK INCOME INPUTS + TOTAL SUMMARY
-    # --------------------------------------------
+    # ----------------------------
+    # INCOME
+    # ----------------------------
     st.markdown("### 💵 Enter This Month's Income")
-
-    # Load saved income values
-    check_values = load_income(account)  # [c1, c2, c3, c4]
+    saved_checks = load_income(account)  # [c1..c4]
 
     c1, c2, c3, c4, c5 = st.columns(5)
+    chk1 = c1.number_input("Check 1 ($)", min_value=0.0, step=100.0,
+                           value=float(saved_checks[0]), key=f"{account}_chk1")
+    chk2 = c2.number_input("Check 2 ($)", min_value=0.0, step=100.0,
+                           value=float(saved_checks[1]), key=f"{account}_chk2")
+    chk3 = c3.number_input("Check 3 ($)", min_value=0.0, step=100.0,
+                           value=float(saved_checks[2]), key=f"{account}_chk3")
+    chk4 = c4.number_input("Check 4 ($)", min_value=0.0, step=100.0,
+                           value=float(saved_checks[3]), key=f"{account}_chk4")
+    checks = [chk1, chk2, chk3, chk4]
+    c5.metric("💰 Total Monthly Income", f"${sum(checks):,.2f}")
 
-    check1 = c1.number_input("Check 1 Amount ($)", min_value=0.0, step=100.0,
-                            value=float(check_values[0]), key=f"{account}_chk1")
-
-    check2 = c2.number_input("Check 2 Amount ($)", min_value=0.0, step=100.0,
-                            value=float(check_values[1]), key=f"{account}_chk2")
-
-    check3 = c3.number_input("Check 3 Amount ($)", min_value=0.0, step=100.0,
-                            value=float(check_values[2]), key=f"{account}_chk3")
-
-    check4 = c4.number_input("Check 4 Amount ($)", min_value=0.0, step=100.0,
-                            value=float(check_values[3]), key=f"{account}_chk4")
-
-    # Build list for saving
-    check_inputs = [check1, check2, check3, check4]
-    total_income = sum(check_inputs)
-
-    c5.metric("💰 Total Monthly Income", f"${total_income:,.2f}")
-
-    # --- Save income (local ONLY for now) ---
     if st.button("💾 Save Income", key=f"save_income_{account}"):
         try:
-            save_income(account, check_inputs)
-            st.success("Income saved successfully!")
+            save_income(account, checks)
+            st.success("Income saved.")
+            st.rerun()
         except Exception as e:
             st.error(f"Error saving income: {e}")
 
-    # Persist income to session_state
-    st.session_state[f"{account}_income"] = total_income
+    # Make total income visible in session for Tab 2
+    st.session_state[f"{account}_income"] = sum(checks)
 
-    if st.button("⚙️ Auto-Generate Budgets", key=f"auto_budget_{account}"):
-        try:
-            budget_df = auto_fill_budget(budget_df, check_inputs, vacancy_pct if vacancy_mode else 0)
-            save_df(budget_df, budget_path)
-            st.success("Budgets auto-generated successfully!")
-        except Exception as e:
-            st.error(f"Error generating budgets: {e}")
-
-
-
-    # -----------------------------
-    # 🏠 VACANCY MODE ADJUSTMENT
-    # -----------------------------
+    # ----------------------------
+    # VACANCY TOGGLE
+    # ----------------------------
     st.markdown("### 🏠 Vacancy Adjustment Mode")
-
     dash_path = os.path.join(DATA_DIR, "dashboard_data.csv")
-    dash_df = load_or_create_csv(dash_path, ["Key", "Value"])
+    dash_df   = load_or_create_csv(dash_path, ["Key","Value"])
 
-    vacancy_key = f"{account}_Vacancy_Mode"
-    vacancy_pct_key = f"{account}_Vacancy_Pct"
+    vac_key      = f"{account}_Vacancy_Mode"
+    vac_pct_key  = f"{account}_Vacancy_Pct"
 
-    # Load defaults
-    saved_mode = dash_df.loc[dash_df["Key"] == vacancy_key, "Value"].iloc[0] if vacancy_key in dash_df["Key"].values else "False"
-    saved_pct  = dash_df.loc[dash_df["Key"] == vacancy_pct_key, "Value"].iloc[0] if vacancy_pct_key in dash_df["Key"].values else 20
+    saved_mode = dash_df.loc[dash_df["Key"] == vac_key, "Value"].iloc[0] if vac_key in dash_df["Key"].values else "False"
+    saved_pct  = float(dash_df.loc[dash_df["Key"] == vac_pct_key, "Value"].iloc[0]) if vac_pct_key in dash_df["Key"].values else float(DEFAULT_VACANCY_REDUCTION)
 
-    vacancy_mode = st.checkbox("Enable Vacancy Mode (temporary income reduction)",
-                            value=(saved_mode == "True"),
-                            key=f"{account}_vacancy_toggle")
+    vacancy_mode = st.checkbox("Enable Vacancy (temporary income reduction)",
+                               value=(saved_mode == "True"),
+                               key=f"{account}_vacancy_toggle")
+    vacancy_pct  = st.slider("Vacancy Reduction %", 0, 100, int(saved_pct), 5,
+                              key=f"{account}_vacancy_pct")
 
-    vacancy_pct = st.slider("Vacancy Reduction %", 0, 100, int(saved_pct), 5,
-                            key=f"{account}_vacancy_pct")
-
-    # Adjusted income
+    adj_income = sum(checks) * ((100 - vacancy_pct)/100.0) if vacancy_mode else sum(checks)
     if vacancy_mode:
-        adj_factor = (100 - vacancy_pct) / 100
-        adjusted_income = total_income * adj_factor
-
-        # Apply vacancy to budgets
-        adj_budget_df = apply_vacancy_to_budget(budget_df, vacancy_pct)
-
-        st.warning(
-            f"Vacancy mode ON — income & budgets reduced by {vacancy_pct}% "
-            f"→ New Income: ${adjusted_income:,.2f}"
-        )
+        st.warning(f"Vacancy ON — income reduced {vacancy_pct}% → ${adj_income:,.2f}")
     else:
-        adjusted_income = total_income
-        adj_budget_df = budget_df.copy()
+        st.info("Vacancy OFF")
 
-    # Save vacancy settings
     if st.button("💾 Save Vacancy Settings", key=f"save_vacancy_{account}"):
-        dash_df = load_or_create_csv(dash_path, ["Key", "Value"])
-
-        updates = {
-            vacancy_key: str(vacancy_mode),
-            vacancy_pct_key: vacancy_pct,
-            f"{account}_Adjusted_Income": adjusted_income
-        }
-
-        for k, v in updates.items():
+        # Persist settings
+        dash_df = load_or_create_csv(dash_path, ["Key","Value"])
+        for k, v in {
+            vac_key: str(vacancy_mode),
+            vac_pct_key: float(vacancy_pct),
+            f"{account}_Adjusted_Income": float(adj_income),
+        }.items():
             if k in dash_df["Key"].values:
                 dash_df.loc[dash_df["Key"] == k, "Value"] = v
             else:
                 dash_df.loc[len(dash_df)] = [k, v]
-
         save_df(dash_df, dash_path)
-        st.success("Vacancy settings saved!")
 
-    # Save adjusted income to session
-    st.session_state[f"{account}_adjusted_income"] = adjusted_income
+        # Also apply the reduction to the *current saved* budget and persist
+        if vacancy_mode:
+            adj_df = apply_vacancy_to_budget(budget_df, vacancy_pct)
+            save_df(adj_df, budget_path)
+            st.success(f"✅ Vacancy saved. Budgets reduced by {vacancy_pct}%.")
+        else:
+            # Save original (no reduction)
+            save_df(budget_df, budget_path)
+            st.success("✅ Vacancy disabled. Original budgets kept.")
 
-#-----
-    # Apply adjustment globally for current session
-    st.session_state[f"{account}_adjusted_income"] = adjusted_income
-    st.session_state[f"{account}_vacancy_mode"] = vacancy_mode
-    #--st.session_state[f"{account}_vacancy_pct"] = vacancy_pct
+        st.rerun()
 
+    # ----------------------------
+    # AUTO-BUDGET FROM PERCENTAGES (INSIDE TAB 1)
+    # ----------------------------
+    st.markdown("### ⚙️ Auto-Generate Budgets From Percentages")
 
-    # -----------------------------
+    # Build a pct table *for the categories you actually have*.
+    # Pre-fill from AUTO_PCTS; missing cats get 0.
+    alloc_df = pd.DataFrame({
+        "Category": budget_df["Category"],
+        "Percent": [AUTO_PCTS.get(cat, 0) for cat in budget_df["Category"]]
+    })
+    alloc_edit = st.data_editor(
+        alloc_df, hide_index=True, num_rows="dynamic",
+        use_container_width=True, key=f"alloc_{account}"
+    )
+    alloc_map = dict(zip(alloc_edit["Category"], alloc_edit["Percent"]))
+
+    if st.button("⚡ Generate Budgets Automatically", key=f"generate_{account}"):
+        try:
+            gen = auto_fill_budget(budget_df.copy(), checks, alloc_map,
+                                   vacancy_mode=vacancy_mode, vacancy_pct=vacancy_pct)
+            save_df(gen, budget_path)
+            st.success("Budgets generated and saved.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error generating budgets: {e}")
+
+    # ----------------------------
     # BUDGET EDITOR & SPENDING
-    # -----------------------------
-    colA,colB = st.columns(2)
+    # ----------------------------
+    colA, colB = st.columns(2)
+
     with colA:
-        st.write("### Per-Check Budgets")
-        edit = st.data_editor(budget_df[["Category","Check1","Check2","Check3","Check4"]],num_rows="dynamic",use_container_width=True,key=f"edit_{account}")
+        st.write("### Per-Check Budgets (editable)")
+        edit = st.data_editor(
+            budget_df[["Category","Check1","Check2","Check3","Check4"]],
+            num_rows="dynamic", use_container_width=True,
+            key=f"edit_{account}"
+        )
+        # Apply edits and recompute total
         for c in ["Check1","Check2","Check3","Check4"]:
-            budget_df[c]=pd.to_numeric(edit[c],errors="coerce").fillna(0)
-        budget_df["Monthly_Total"]=budget_df[["Check1","Check2","Check3","Check4"]].sum(axis=1)
-        st.dataframe(adj_budget_df[["Category","Monthly_Total"]], use_container_width=True)
-        if st.button("💾 Save Budgets",key=f"saveb_{account}"):
-            save_df(adj_budget_df, budget_path)
-            st.success("Budgets saved locally.")
+            budget_df[c] = pd.to_numeric(edit[c], errors="coerce").fillna(0.0)
+        budget_df["Monthly_Total"] = budget_df[["Check1","Check2","Check3","Check4"]].sum(axis=1)
+
+        st.dataframe(budget_df[["Category","Monthly_Total"]], use_container_width=True, height=260)
+
+        if st.button("💾 Save Budgets", key=f"saveb_{account}"):
+            save_df(budget_df, budget_path)
+            st.success("Budgets saved.")
+            st.rerun()
 
     with colB:
         st.write("### Actual Spending (to date)")
-        spending_df["Amount"]=pd.to_numeric(spending_df.get("Amount",0),errors="coerce").fillna(0)
-        totals=spending_df.groupby("Category")["Amount"].sum().reindex(budget_df["Category"],fill_value=0).reset_index()
-        st.dataframe(totals,use_container_width=True)
+        totals = (spending_df.groupby("Category")["Amount"].sum()
+                  .reindex(budget_df["Category"], fill_value=0)
+                  .reset_index())
+        st.dataframe(totals, use_container_width=True)
 
-    # -----------------------------
+    # ----------------------------
     # ADD TRANSACTION
-    # -----------------------------
+    # ----------------------------
     st.divider()
     st.subheader(f"Add Transaction ({account})")
-    with st.form(f"addtxn_{account}",clear_on_submit=True):
-        c1,c2,c3,c4=st.columns(4)
-        date=c1.date_input("Date",dt.date.today())
-        cat=c2.selectbox("Category",budget_df["Category"])
-        amt=c3.number_input("Amount ($)",0.0,step=1.0)
-        chk=c4.selectbox("Check #", [1,2,3,4])
-        memo=st.text_input("Memo (optional)")
+    with st.form(f"addtxn_{account}", clear_on_submit=True):
+        c1, c2, c3, c4 = st.columns(4)
+        date = c1.date_input("Date", dt.date.today())
+        cat  = c2.selectbox("Category", budget_df["Category"])
+        amt  = c3.number_input("Amount ($)", 0.0, step=1.0)
+        chk  = c4.selectbox("Check #", [1,2,3,4])
+        memo = st.text_input("Memo (optional)")
+
         if st.form_submit_button("Add"):
-            spending_df.loc[len(spending_df)] = [str(date),cat,amt,memo]
-            save_df(spending_df,spend_path)
+            spending_df.loc[len(spending_df)] = [str(date), cat, amt, memo]
+            save_df(spending_df, spend_path)
             st.success("Transaction added!")
+
 
 # ==========================================================
 # TAB 2 — INSIGHTS DASHBOARD
