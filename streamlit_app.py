@@ -3,10 +3,27 @@ import pandas as pd
 import streamlit as st
 import plotly.express as px
 
+
+AUTO_PCTS = {
+    "Tithe": 10,
+    "Rental Reserve": 10,
+    "Savings (Emergency)": 5,
+    "Investing": 5,
+    "Food": 10,
+    "Transportation": 10,
+    "Insurance/Health": 5, 
+    "Child": 5, 
+    "Debt": 5,
+    "Clothing/Personal": 5, 
+    "Subscriptions/Misc": 5, 
+    "Continued Education": 5,
+    "Fun/Joys/Travel": 5
+    # Remaining categories get proportionally allocated
+}
 # ---------------------------------------
 # GOOGLE SHEETS SUPPORT
 # ---------------------------------------
-# -- USE_SHEETS_DEFAULT = False  # Default checked value--#
+#USE_SHEETS_DEFAULT = False  # Default checked value
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 # Try loading Google Sheets libraries
@@ -36,9 +53,11 @@ def get_gspread_client_from_secrets():
 # ---------------------------
 st.set_page_config(page_title="Family Stewardship Dashboard", page_icon="📊", layout="wide")
 
-DATA_DIR = "data" 
+DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
-USE_SHEETS_DEFAULT = False  
+
+# Line 40 (Add the definition here)
+USE_SHEETS_DEFAULT = False
 
 # Default settings
 DEFAULT_RENTAL_MONTHLY = 2500.0
@@ -81,7 +100,6 @@ def ensure_budget_schema(df):
         if c not in df.columns: df[c] = 0.0
     df["Monthly_Total"] = df[["Check1","Check2","Check3","Check4"]].fillna(0).sum(axis=1)
     return df[cols]
-
 
 def load_income(account):
     dash_path = os.path.join(DATA_DIR,"dashboard_data.csv")
@@ -158,6 +176,44 @@ def apply_vacancy_to_budget(budget_df, vacancy_pct):
 
     return adj_df
 
+def auto_fill_budget(df, check_inputs, vacancy_pct=0):
+    """
+    Automatically fills the Check1–Check4 budget amounts based on 
+    percentage rules + vacancy reduction.
+    """
+
+    adj_factor = (100 - vacancy_pct) / 100  # vacancy reduction
+
+    for idx, row in df.iterrows():
+        cat = row["Category"]
+
+        # Fixed % categories
+        if cat in AUTO_PCTS:
+            pct = AUTO_PCTS[cat] / 100
+
+            # Calculate each check amount
+            df.at[idx, "Check1"] = check_inputs[0] * pct * adj_factor
+            df.at[idx, "Check2"] = check_inputs[1] * pct * adj_factor
+            df.at[idx, "Check3"] = check_inputs[2] * pct * adj_factor
+            df.at[idx, "Check4"] = check_inputs[3] * pct * adj_factor
+
+        # Flexible categories get "whatever is left"
+        else:
+            # First calculate the sum of fixed % categories
+            fixed_total_pct = sum(AUTO_PCTS.values()) / 100
+            remaining_pct = (1 - fixed_total_pct)
+
+            # Give proportional allocation
+            df.at[idx, "Check1"] = check_inputs[0] * remaining_pct * adj_factor / (len(df) - len(AUTO_PCTS))
+            df.at[idx, "Check2"] = check_inputs[1] * remaining_pct * adj_factor / (len(df) - len(AUTO_PCTS))
+            df.at[idx, "Check3"] = check_inputs[2] * remaining_pct * adj_factor / (len(df) - len(AUTO_PCTS))
+            df.at[idx, "Check4"] = check_inputs[3] * remaining_pct * adj_factor / (len(df) - len(AUTO_PCTS))
+
+    # Recalculate monthly total
+    df["Monthly_Total"] = df[["Check1","Check2","Check3","Check4"]].sum(axis=1)
+    return df
+
+
 # ---------------------------
 # MAIN APP
 # ---------------------------
@@ -180,10 +236,17 @@ with tab1:
 for c in ["Amount","Check1","Check2","Check3","Check4","Monthly_Total"]:
     if c in budget_df.columns:
         budget_df[c] = pd.to_numeric(budget_df[c], errors="coerce").fillna(0)
-    
+
     # Show the header ONLY once
     st.subheader(f"{account} Overview")
 #---
+
+# ---------------------------------------------------------
+# LOAD VACANCY STATE GLOBALLY FOR AUTO-BUDGET GENERATION
+# ---------------------------------------------------------
+    vacancy_mode = st.session_state.get(f"{account}_vacancy_mode", False)
+    vacancy_pct = st.session_state.get(f"{account}_vacancy_pct", DEFAULT_VACANCY_REDUCTION)
+
     # --------------------------------------------
     # 🧾 PER-CHECK INCOME INPUTS + TOTAL SUMMARY
     # --------------------------------------------
@@ -222,6 +285,15 @@ for c in ["Amount","Check1","Check2","Check3","Check4","Monthly_Total"]:
 
     # Persist income to session_state
     st.session_state[f"{account}_income"] = total_income
+
+    if st.button("⚙️ Auto-Generate Budgets", key=f"auto_budget_{account}"):
+        try:
+            budget_df = auto_fill_budget(budget_df, check_inputs, vacancy_pct if vacancy_mode else 0)
+            save_df(budget_df, budget_path)
+            st.success("Budgets auto-generated successfully!")
+        except Exception as e:
+            st.error(f"Error generating budgets: {e}")
+
 
 
     # -----------------------------
